@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException, BadRequestException, Logger } from '@nestjs/common';
+import { Injectable, BadRequestException, NotFoundException, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, DataSource, SelectQueryBuilder } from 'typeorm';
 import { Task } from './entities/task.entity';
@@ -21,7 +21,7 @@ export class TasksService {
     @InjectRepository(Task)
     private tasksRepository: Repository<Task>,
     @InjectQueue('task-processing')
-    private taskQueue: Queue,
+    private taskQueue: Queue | null,
     private dataSource: DataSource,
   ) {}
 
@@ -37,20 +37,24 @@ export class TasksService {
       const savedTask = await queryRunner.manager.save(Task, task);
 
       // Add to queue with proper error handling
-      try {
-        await this.taskQueue.add('task-status-update', {
-          taskId: savedTask.id,
-          status: savedTask.status,
-        }, {
-          attempts: 3,
-          backoff: {
-            type: 'exponential',
-            delay: 2000,
-          },
-        });
-      } catch (queueError) {
-        this.logger.error(`Failed to add task ${savedTask.id} to queue:`, queueError);
-        // Don't fail the transaction for queue errors, just log them
+      if (this.taskQueue) {
+        try {
+          await this.taskQueue.add('task-status-update', {
+            taskId: savedTask.id,
+            status: savedTask.status,
+          }, {
+            attempts: 3,
+            backoff: {
+              type: 'exponential',
+              delay: 2000,
+            },
+          });
+        } catch (queueError) {
+          this.logger.error(`Failed to add task ${savedTask.id} to queue:`, queueError);
+          // Don't fail the transaction for queue errors, just log them
+        }
+      } else {
+        this.logger.warn('Queue not available - task processing will be limited');
       }
 
       await queryRunner.commitTransaction();
@@ -131,7 +135,7 @@ export class TasksService {
       const updatedTask = await queryRunner.manager.save(Task, task);
 
       // Add to queue if status changed
-      if (originalStatus !== updatedTask.status) {
+      if (originalStatus !== updatedTask.status && this.taskQueue) {
         try {
           await this.taskQueue.add('task-status-update', {
             taskId: updatedTask.id,

@@ -1,6 +1,5 @@
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
-import { BullModule } from '@nestjs/bullmq';
 import { TasksService } from './tasks.service';
 import { TasksController } from './tasks.controller';
 import { Task } from './entities/task.entity';
@@ -8,9 +7,12 @@ import { Task } from './entities/task.entity';
 @Module({
   imports: [
     TypeOrmModule.forFeature([Task]),
-    BullModule.registerQueue({
-      name: 'task-processing',
-    }),
+    // Queue module - only load if Redis is enabled
+    ...(process.env.REDIS_ENABLED !== 'false' ? [
+      require('@nestjs/bullmq').BullModule.registerQueue({
+        name: 'task-processing',
+      }),
+    ] : []),
   ],
   controllers: [TasksController],
   providers: [TasksService],
