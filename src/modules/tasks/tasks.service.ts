@@ -1,102 +1,362 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { Repository, DataSource, SelectQueryBuilder } from 'typeorm';
 import { Task } from './entities/task.entity';
 import { CreateTaskDto } from './dto/create-task.dto';
 import { UpdateTaskDto } from './dto/update-task.dto';
+import { QueryTaskDto } from './dto/query-task.dto';
+import { BatchTaskDto } from './dto/batch-task.dto';
+import { PaginatedTasksDto } from './dto/paginated-tasks.dto';
+import { TaskStatsDto } from './dto/task-stats.dto';
 import { InjectQueue } from '@nestjs/bullmq';
-import { Queue } from 'bullmq';
+import { Queue, Job } from 'bullmq';
 import { TaskStatus } from './enums/task-status.enum';
+import { TaskPriority } from './enums/task-priority.enum';
 
 @Injectable()
 export class TasksService {
+  private readonly logger = new Logger(TasksService.name);
+
   constructor(
     @InjectRepository(Task)
     private tasksRepository: Repository<Task>,
     @InjectQueue('task-processing')
     private taskQueue: Queue,
+    private dataSource: DataSource,
   ) {}
 
   async create(createTaskDto: CreateTaskDto): Promise<Task> {
-    // Inefficient implementation: creates the task but doesn't use a single transaction
-    // for creating and adding to queue, potential for inconsistent state
-    const task = this.tasksRepository.create(createTaskDto);
-    const savedTask = await this.tasksRepository.save(task);
+    const queryRunner = this.dataSource.createQueryRunner();
+    
+    try {
+      await queryRunner.connect();
+      await queryRunner.startTransaction();
 
-    // Add to queue without waiting for confirmation or handling errors
-    this.taskQueue.add('task-status-update', {
-      taskId: savedTask.id,
-      status: savedTask.status,
-    });
+      // Create the task
+      const task = this.tasksRepository.create(createTaskDto);
+      const savedTask = await queryRunner.manager.save(Task, task);
 
-    return savedTask;
+      // Add to queue with proper error handling
+      try {
+        await this.taskQueue.add('task-status-update', {
+          taskId: savedTask.id,
+          status: savedTask.status,
+        }, {
+          attempts: 3,
+          backoff: {
+            type: 'exponential',
+            delay: 2000,
+          },
+        });
+      } catch (queueError) {
+        this.logger.error(`Failed to add task ${savedTask.id} to queue:`, queueError);
+        // Don't fail the transaction for queue errors, just log them
+      }
+
+      await queryRunner.commitTransaction();
+      return savedTask;
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      this.logger.error('Failed to create task:', error);
+      throw new BadRequestException('Failed to create task');
+    } finally {
+      await queryRunner.release();
+    }
   }
 
-  async findAll(): Promise<Task[]> {
-    // Inefficient implementation: retrieves all tasks without pagination
-    // and loads all relations, causing potential performance issues
-    return this.tasksRepository.find({
-      relations: ['user'],
-    });
+  async findAll(queryDto: QueryTaskDto): Promise<PaginatedTasksDto> {
+    const { page = 1, limit = 10, sortBy = 'createdAt', sortOrder = 'DESC' } = queryDto;
+    
+    // Build efficient query with proper joins and filtering
+    const queryBuilder = this.buildTaskQuery(queryDto);
+    
+    // Get total count for pagination
+    const total = await queryBuilder.getCount();
+    
+    // Apply pagination and sorting
+    const offset = (page - 1) * limit;
+    const tasks = await queryBuilder
+      .orderBy(`task.${sortBy}`, sortOrder)
+      .skip(offset)
+      .take(limit)
+      .getMany();
+
+    const totalPages = Math.ceil(total / limit);
+    
+    return {
+      data: tasks,
+      total,
+      page,
+      limit,
+      totalPages,
+      hasNext: page < totalPages,
+      hasPrev: page > 1,
+    };
   }
 
   async findOne(id: string): Promise<Task> {
-    // Inefficient implementation: two separate database calls
-    const count = await this.tasksRepository.count({ where: { id } });
+    const task = await this.tasksRepository.findOne({
+      where: { id },
+      relations: ['user'],
+    });
 
-    if (count === 0) {
+    if (!task) {
       throw new NotFoundException(`Task with ID ${id} not found`);
     }
 
-    return (await this.tasksRepository.findOne({
-      where: { id },
-      relations: ['user'],
-    })) as Task;
+    return task;
   }
 
   async update(id: string, updateTaskDto: UpdateTaskDto): Promise<Task> {
-    // Inefficient implementation: multiple database calls
-    // and no transaction handling
-    const task = await this.findOne(id);
+    const queryRunner = this.dataSource.createQueryRunner();
+        
+    try {
+      await queryRunner.connect();
+      await queryRunner.startTransaction();
 
-    const originalStatus = task.status;
-
-    // Directly update each field individually
-    if (updateTaskDto.title) task.title = updateTaskDto.title;
-    if (updateTaskDto.description) task.description = updateTaskDto.description;
-    if (updateTaskDto.status) task.status = updateTaskDto.status;
-    if (updateTaskDto.priority) task.priority = updateTaskDto.priority;
-    if (updateTaskDto.dueDate) task.dueDate = updateTaskDto.dueDate;
-
-    const updatedTask = await this.tasksRepository.save(task);
-
-    // Add to queue if status changed, but without proper error handling
-    if (originalStatus !== updatedTask.status) {
-      this.taskQueue.add('task-status-update', {
-        taskId: updatedTask.id,
-        status: updatedTask.status,
+      // Get task with lock to prevent concurrent updates
+      const task = await queryRunner.manager.findOne(Task, {
+        where: { id },
+        lock: { mode: 'pessimistic_write' },
       });
-    }
 
-    return updatedTask;
+      if (!task) {
+        throw new NotFoundException(`Task with ID ${id} not found`);
+      }
+
+      const originalStatus = task.status;
+
+      // Update task fields efficiently
+      Object.assign(task, updateTaskDto);
+      const updatedTask = await queryRunner.manager.save(Task, task);
+
+      // Add to queue if status changed
+      if (originalStatus !== updatedTask.status) {
+        try {
+          await this.taskQueue.add('task-status-update', {
+            taskId: updatedTask.id,
+            status: updatedTask.status,
+          }, {
+            attempts: 3,
+            backoff: {
+              type: 'exponential',
+              delay: 2000,
+            },
+          });
+        } catch (queueError) {
+          this.logger.error(`Failed to add status update to queue for task ${id}:`, queueError);
+        }
+      }
+
+      await queryRunner.commitTransaction();
+      return updatedTask;
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      if (error instanceof NotFoundException) {
+        throw error;
+      }
+      this.logger.error(`Failed to update task ${id}:`, error);
+      throw new BadRequestException('Failed to update task');
+    } finally {
+      await queryRunner.release();
+    }
   }
 
   async remove(id: string): Promise<void> {
-    // Inefficient implementation: two separate database calls
-    const task = await this.findOne(id);
-    await this.tasksRepository.remove(task);
+    const queryRunner = this.dataSource.createQueryRunner();
+    
+    try {
+      await queryRunner.connect();
+      await queryRunner.startTransaction();
+
+      const task = await queryRunner.manager.findOne(Task, {
+        where: { id },
+        lock: { mode: 'pessimistic_write' },
+      });
+
+      if (!task) {
+        throw new NotFoundException(`Task with ID ${id} not found`);
+      }
+
+      await queryRunner.manager.remove(Task, task);
+      await queryRunner.commitTransaction();
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      if (error instanceof NotFoundException) {
+        throw error;
+      }
+      this.logger.error(`Failed to remove task ${id}:`, error);
+      throw new BadRequestException('Failed to remove task');
+    } finally {
+      await queryRunner.release();
+    }
   }
 
   async findByStatus(status: TaskStatus): Promise<Task[]> {
-    // Inefficient implementation: doesn't use proper repository patterns
-    const query = 'SELECT * FROM tasks WHERE status = $1';
-    return this.tasksRepository.query(query, [status]);
+    return this.tasksRepository.find({
+      where: { status },
+      relations: ['user'],
+    });
   }
 
   async updateStatus(id: string, status: string): Promise<Task> {
-    // This method will be called by the task processor
     const task = await this.findOne(id);
-    task.status = status as any;
+    task.status = status as TaskStatus;
     return this.tasksRepository.save(task);
+  }
+
+  async getStats(): Promise<TaskStatsDto> {
+    // Use efficient SQL aggregation instead of N+1 queries
+    const stats = await this.tasksRepository
+      .createQueryBuilder('task')
+      .select([
+        'COUNT(*) as total',
+        'COUNT(CASE WHEN task.status = :completed THEN 1 END) as completed',
+        'COUNT(CASE WHEN task.status = :inProgress THEN 1 END) as inProgress',
+        'COUNT(CASE WHEN task.status = :pending THEN 1 END) as pending',
+        'COUNT(CASE WHEN task.priority = :highPriority THEN 1 END) as highPriority',
+        'COUNT(CASE WHEN task.priority = :mediumPriority THEN 1 END) as mediumPriority',
+        'COUNT(CASE WHEN task.priority = :lowPriority THEN 1 END) as lowPriority',
+        'COUNT(CASE WHEN task.dueDate < :now AND task.status != :completed THEN 1 END) as overdue'
+      ])
+      .setParameters({
+        completed: TaskStatus.COMPLETED,
+        inProgress: TaskStatus.IN_PROGRESS,
+        pending: TaskStatus.PENDING,
+        highPriority: TaskPriority.HIGH,
+        mediumPriority: TaskPriority.MEDIUM,
+        lowPriority: TaskPriority.LOW,
+        now: new Date(),
+      })
+      .getRawOne();
+
+    const total = Number(stats.total) || 0;
+    const completed = Number(stats.completed) || 0;
+    const completionRate = total > 0 ? Math.round((completed / total) * 100) : 0;
+
+    return {
+      total,
+      completed,
+      inProgress: Number(stats.inProgress) || 0,
+      pending: Number(stats.pending) || 0,
+      highPriority: Number(stats.highPriority) || 0,
+      mediumPriority: Number(stats.mediumPriority) || 0,
+      lowPriority: Number(stats.lowPriority) || 0,
+      overdue: Number(stats.overdue) || 0,
+      completionRate,
+    };
+  }
+
+  async batchProcess(batchDto: BatchTaskDto): Promise<any[]> {
+    const { taskIds, action, newStatus, newPriority } = batchDto;
+    const queryRunner = this.dataSource.createQueryRunner();
+    
+    try {
+      await queryRunner.connect();
+      await queryRunner.startTransaction();
+
+      const results = [];
+
+      switch (action) {
+        case 'complete':
+          // Bulk update status to completed
+          await queryRunner.manager
+            .createQueryBuilder()
+            .update(Task)
+            .set({ status: TaskStatus.COMPLETED })
+            .whereInIds(taskIds)
+            .execute();
+          
+          results.push({ action: 'complete', success: true, affected: taskIds.length });
+          break;
+
+        case 'delete':
+          // Bulk delete tasks
+          await queryRunner.manager
+            .createQueryBuilder()
+            .delete()
+            .from(Task)
+            .whereInIds(taskIds)
+            .execute();
+          
+          results.push({ action: 'delete', success: true, affected: taskIds.length });
+          break;
+
+        case 'update_status':
+          if (!newStatus) {
+            throw new BadRequestException('New status is required for update_status action');
+          }
+          
+          await queryRunner.manager
+            .createQueryBuilder()
+            .update(Task)
+            .set({ status: newStatus })
+            .whereInIds(taskIds)
+            .execute();
+          
+          results.push({ action: 'update_status', success: true, affected: taskIds.length, newStatus });
+          break;
+
+        case 'update_priority':
+          if (!newPriority) {
+            throw new BadRequestException('New priority is required for update_priority action');
+          }
+          
+          await queryRunner.manager
+            .createQueryBuilder()
+            .update(Task)
+            .set({ priority: newPriority as TaskPriority })
+            .whereInIds(taskIds)
+            .execute();
+          
+          results.push({ action: 'update_priority', success: true, affected: taskIds.length, newPriority });
+          break;
+
+        default:
+          throw new BadRequestException(`Unknown action: ${action}`);
+      }
+
+      await queryRunner.commitTransaction();
+      return results;
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      this.logger.error(`Batch operation failed: ${message}`, error instanceof Error ? error.stack : undefined);
+      throw new BadRequestException(`Batch operation failed: ${message}`);
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  private buildTaskQuery(queryDto: QueryTaskDto): SelectQueryBuilder<Task> {
+    const queryBuilder = this.tasksRepository
+      .createQueryBuilder('task')
+      .leftJoinAndSelect('task.user', 'user');
+
+    // Apply filters
+    if (queryDto.status) {
+      queryBuilder.andWhere('task.status = :status', { status: queryDto.status });
+    }
+
+    if (queryDto.priority) {
+      queryBuilder.andWhere('task.priority = :priority', { priority: queryDto.priority });
+    }
+
+    if (queryDto.userId) {
+      queryBuilder.andWhere('task.userId = :userId', { userId: queryDto.userId });
+    }
+
+    if (queryDto.search) {
+      queryBuilder.andWhere(
+        '(task.title ILIKE :search OR task.description ILIKE :search)',
+        { search: `%${queryDto.search}%` }
+      );
+    }
+
+    if (queryDto.dueDate) {
+      queryBuilder.andWhere('task.dueDate = :dueDate', { dueDate: queryDto.dueDate });
+    }
+
+    return queryBuilder;
   }
 }
